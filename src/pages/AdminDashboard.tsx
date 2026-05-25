@@ -68,8 +68,6 @@ const STATUS_COLORS: Record<string, string> = {
   cancelled:         "#EF4444",
 };
 
-const TWILIO_WA_NUMBER = "whatsapp:+14155238886";
-
 // ── Status update message templates ───────────────────────────
 function statusMessage(status: string, order: Order): string {
   const produce = order.produce_name || "produce";
@@ -125,7 +123,7 @@ export default function AdminDashboard() {
         farmer_name:   (o.ff_farmers  as Record<string,string>)?.name,
         farmer_mobile: (o.ff_farmers  as Record<string,string>)?.mobile,
         farmer_village:(o.ff_farmers  as Record<string,string>)?.village,
-      })) as Order[];
+      })) as unknown as Order[];
       setOrders(mapped);
     }
     setLoading(false);
