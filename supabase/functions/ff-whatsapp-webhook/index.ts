@@ -123,6 +123,11 @@ Deno.serve(async (req: Request) => {
       return twilioReply(await handleWalkDone(farmer));
     }
 
+    // HEALTH → satellite crop-health summary (farm intelligence layer)
+    if (body.toUpperCase() === "HEALTH" && farmer) {
+      return twilioReply(await handleHealthQuery(farmer));
+    }
+
     // Location pin → farmer is walking the boundary
     if (payload.Latitude && payload.Longitude && farmer) {
       return twilioReply(await handleLocationPin(payload, farmer));
@@ -703,6 +708,56 @@ function computeAreaAcres(coords: number[][]): number {
   const sqKm  = area * 111 * 108;
   const acres = sqKm * 247.105;
   return acres;
+}
+
+// ── Farm intelligence: HEALTH ───────────────────────────────────
+async function handleHealthQuery(
+  farmer: { id: string; name: string }
+): Promise<string> {
+  try {
+    const { data: rows, error } = await supabase
+      .from("ff_farm_health_latest")
+      .select("*")
+      .eq("farmer_id", farmer.id);
+
+    if (error || !rows || rows.length === 0) {
+      return (
+        `🛰️ Nimma farm satellite report innu ready illa, ${farmer.name}.\n\n` +
+        `Farm boundary illadiddare WALK antha kali.\n\n` +
+        `(No satellite report yet. If you haven't mapped your farm, send WALK. ` +
+        `Reports appear within ~5 days of mapping.)`
+      );
+    }
+
+    return rows.map((r: {
+      plot_name: string; area_acres: number; observed_at: string; ndvi_mean: number;
+      prev_ndvi_mean: number | null; stressed_pct: number | null; ndwi_mean: number | null;
+    }) => {
+      const v = r.ndvi_mean;
+      const [kn, en, icon] =
+        v >= 0.6 ? ["Bele chennagide", "Crop looks healthy", "🟢"] :
+        v >= 0.4 ? ["Bele madhyama", "Moderate growth", "🟡"] :
+        v >= 0.2 ? ["Bele duraballa", "Weak / sparse crop", "🟠"] :
+                   ["Bele kaanuttilla / khaali", "Little or no crop visible", "🔴"];
+      let trend = "";
+      if (r.prev_ndvi_mean != null) {
+        const d = v - r.prev_ndvi_mean;
+        trend = d > 0.05 ? "📈 Improving" : d < -0.05 ? "📉 Declining — check water/pests" : "➡️ Stable";
+      }
+      const stress = (r.stressed_pct ?? 0) >= 0.15
+        ? `⚠️ ${Math.round((r.stressed_pct ?? 0) * 100)}% of the farm is weaker than the rest — inspect those patches.\n`
+        : "";
+      const date = new Date(r.observed_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+      return (
+        `🛰️ ${r.plot_name} (${r.area_acres.toFixed(2)} acres) — ${date}\n` +
+        `${icon} ${kn}\n(${en}, NDVI ${v.toFixed(2)})\n` +
+        (trend ? `${trend}\n` : "") + stress
+      );
+    }).join("\n");
+  } catch (err) {
+    console.error("Health query error:", err);
+    return "Satellite report sigalilla. Matte try maadi. 🙏\n(Could not fetch report, try again.)";
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────
