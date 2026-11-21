@@ -123,6 +123,24 @@ Deno.serve(async (req: Request) => {
       return twilioReply(await handleWalkDone(farmer));
     }
 
+    // Farm intelligence 2: weather, crop calendar, soil
+    const cmd = body.toUpperCase();
+    if (farmer && (cmd === "WEATHER" || cmd === "HAVAMANA")) {
+      return twilioReply(await handleWeatherQuery(farmer));
+    }
+    if (farmer && (cmd === "CROP" || cmd === "BELE")) {
+      return twilioReply(await handleCropQuery(farmer));
+    }
+    if (farmer && (cmd === "SOIL" || cmd === "MANNU")) {
+      return twilioReply(await handleSoilQuery(farmer));
+    }
+    if (farmer && (cmd.startsWith("SOWN:") || cmd.startsWith("BITTHANE:"))) {
+      return twilioReply(await handleSown(body, farmer));
+    }
+    if (farmer && (cmd === "MENU" || cmd === "HELP")) {
+      return twilioReply(farmMenu(farmer.name));
+    }
+
     // HEALTH → satellite crop-health summary (farm intelligence layer)
     if (body.toUpperCase() === "HEALTH" && farmer) {
       return twilioReply(await handleHealthQuery(farmer));
@@ -757,6 +775,232 @@ async function handleHealthQuery(
   } catch (err) {
     console.error("Health query error:", err);
     return "Satellite report sigalilla. Matte try maadi. 🙏\n(Could not fetch report, try again.)";
+  }
+}
+
+// ── Farm intelligence 2: weather · crop calendar · soil ─────────
+type Farmer = { id: string; name: string };
+type FarmRow = { id: string; plot_name: string; area_acres: number };
+
+function todayIST(): string {
+  return new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function shortDate(iso: string): string {
+  return new Date(iso + "T00:00:00Z").toLocaleDateString("en-IN", { day: "numeric", month: "short", timeZone: "UTC" });
+}
+function clip(msg: string): string {
+  return msg.length > 1500 ? msg.slice(0, 1490) + "\n…" : msg;
+}
+async function farmerFarms(farmerId: string): Promise<FarmRow[]> {
+  const { data } = await supabase
+    .from("ff_farms")
+    .select("id, plot_name, area_acres, source, created_at")
+    .eq("farmer_id", farmerId)
+    .eq("is_active", true)
+    .order("created_at", { ascending: true });
+  // real plots first, test plots after
+  return ((data || []) as (FarmRow & { source: string })[])
+    .sort((a, b) => Number(a.source === "test") - Number(b.source === "test"));
+}
+function morePlots(n: number): string {
+  return n > 3 ? `\n\n(+${n - 3} innashtu plot — showing first 3 plots)` : "";
+}
+const NO_FARM =
+  "🗺️ Modalu nimma farm map maadi — WALK antha kali.\n\n" +
+  "(Map your farm first — send WALK and share your location at each corner.)";
+
+function farmMenu(name: string): string {
+  return (
+    `🌾 FarmFeast menu, ${name}:\n\n` +
+    `🌦 WEATHER — 3 dinada havamana + alerts\n` +
+    `🌱 CROP — bele hantha, koylu dina\n` +
+    `🧪 SOIL — mannu + gobbara\n` +
+    `🛰 HEALTH — satellite bele arogya\n` +
+    `✍️ SOWN: Tomato — bitthida mele kali (date optional: SOWN: Ragi 05-11)\n` +
+    `🗺 WALK — farm boundary\n` +
+    `📦 STATUS — listings\n\n` +
+    `(Weather, crop stage, soil & fertiliser, crop health, record sowing, map farm, listings.)`
+  );
+}
+
+async function handleWeatherQuery(farmer: Farmer): Promise<string> {
+  try {
+    const farms = await farmerFarms(farmer.id);
+    if (!farms.length) return NO_FARM;
+    const today = todayIST();
+    const parts: string[] = [];
+    for (const f of farms.slice(0, 3)) {
+      const { data: days } = await supabase
+        .from("ff_weather_daily")
+        .select("day, tmax_c, tmin_c, rain_mm, rain_prob_pct")
+        .eq("farm_id", f.id).gte("day", today).order("day").limit(3);
+      if (!days || !days.length) continue;
+      const lines = days.map((d: { day: string; tmax_c: number; tmin_c: number; rain_mm: number; rain_prob_pct: number }) => {
+        const icon = d.rain_mm >= 10 ? "🌧️" : d.rain_mm >= 1 ? "🌦️" : "☀️";
+        return `${shortDate(d.day)} ${icon} ${Math.round(d.tmax_c)}°/${Math.round(d.tmin_c)}° · ${d.rain_mm.toFixed(0)} mm (${Math.round(d.rain_prob_pct ?? 0)}%)`;
+      });
+      parts.push(`📍 ${f.plot_name}\n${lines.join("\n")}`);
+    }
+    if (!parts.length) {
+      return "🌦️ Havamana maahiti innu ready illa. Naale matte nodi.\n(Weather not ready yet — check again tomorrow.)";
+    }
+    const { data: alerts } = await supabase
+      .from("ff_advisories")
+      .select("farm_id, message, severity, valid_for")
+      .in("farm_id", farms.map((f) => f.id))
+      .in("severity", ["warn", "alert"])
+      .gte("valid_for", today)
+      .in("kind", ["heavy_rain", "harvest_rain", "heat", "dry_spell", "wind"])
+      .order("severity", { ascending: true })      // "alert" sorts before "warn"
+      .order("valid_for").limit(4);
+    const plotName = new Map(farms.map((f) => [f.id, f.plot_name]));
+    const alertTxt = alerts && alerts.length
+      ? "\n\n⚠️ Alerts:\n" + alerts.map((a: { farm_id: string; message: string }) =>
+          (farms.length > 1 ? `📍 ${plotName.get(a.farm_id)}\n` : "") + a.message).join("\n\n")
+      : "\n\n✅ Yaavude alert illa. (No weather alerts.)";
+    return clip(`🌦️ Havamana, ${farmer.name}:\n\n${parts.join("\n\n")}${morePlots(farms.length)}${alertTxt}`);
+  } catch (err) {
+    console.error("Weather query error:", err);
+    return "Havamana sigalilla. Matte try maadi. 🙏\n(Could not fetch weather, try again.)";
+  }
+}
+
+async function handleCropQuery(farmer: Farmer): Promise<string> {
+  try {
+    const { data: rows } = await supabase
+      .from("ff_farm_crop_status")
+      .select("plot_name, name_en, name_kn, stage, days_since_sowing, expected_harvest, days_to_harvest")
+      .eq("farmer_id", farmer.id);
+    const stageText: Record<string, string> = {
+      initial: "Modala hantha (establishment)", development: "Beleyuva hantha (vegetative)",
+      mid_season: "Madhya hantha (flowering/fruiting)", late_season: "Koneya hantha (maturity)",
+      harvest_due: "Koylu hantha (ready to harvest)", not_sown: "Innu bitthilla (not sown yet)",
+    };
+    if (!rows || !rows.length) {
+      const farms = await farmerFarms(farmer.id);
+      if (!farms.length) return NO_FARM;
+      const { data: sw } = await supabase
+        .from("ff_advisories").select("message")
+        .in("farm_id", farms.map((f) => f.id)).eq("kind", "sow_window")
+        .order("valid_for", { ascending: false }).limit(1);
+      return clip(
+        `🌱 Yaavude bele daakhalisilla, ${farmer.name}.\n` +
+        `Bitthida mele kali: SOWN: Tomato\n(No crop recorded. After sowing, send e.g. SOWN: Tomato)` +
+        (sw && sw.length ? `\n\n${sw[0].message}` : "")
+      );
+    }
+    const out = rows.map((r: { plot_name: string; name_en: string; name_kn: string; stage: string;
+      days_since_sowing: number; expected_harvest: string; days_to_harvest: number }) => {
+      const pct = Math.max(0, Math.min(10, Math.round((r.days_since_sowing / (r.days_since_sowing + Math.max(r.days_to_harvest, 0))) * 10)));
+      const bar = "▓".repeat(pct) + "░".repeat(10 - pct);
+      const when = r.days_to_harvest > 0
+        ? `Koylu ~${shortDate(r.expected_harvest)} (${r.days_to_harvest} dina / days)`
+        : `Koylu samaya bandide! (Harvest due)`;
+      return `🌿 ${r.name_kn} — ${r.plot_name}\n${bar} dina ${r.days_since_sowing}\n${stageText[r.stage] ?? r.stage}\n${when}`;
+    });
+    return clip(`🌱 Nimma bele, ${farmer.name}:\n\n${out.join("\n\n")}`);
+  } catch (err) {
+    console.error("Crop query error:", err);
+    return "Bele maahiti sigalilla. Matte try maadi. 🙏\n(Could not fetch crop info, try again.)";
+  }
+}
+
+async function handleSoilQuery(farmer: Farmer): Promise<string> {
+  try {
+    const farms = await farmerFarms(farmer.id);
+    if (!farms.length) return NO_FARM;
+    const parts: string[] = [];
+    for (const f of farms.slice(0, 3)) {
+      const { data: soil } = await supabase
+        .from("ff_soil_profiles")
+        .select("ph, soc_g_kg, texture, clay_pct, sand_pct")
+        .eq("farm_id", f.id).maybeSingle();
+      if (!soil) continue;
+      const ph = soil.ph as number;
+      const phTxt = ph < 5.5 ? "huli (acidic)" : ph < 6.5 ? "swalpa huli (slightly acidic)"
+        : ph <= 7.5 ? "samatola (neutral)" : ph <= 8.5 ? "kshaara (alkaline)" : "tumba kshaara (strongly alkaline)";
+      const oc = soil.soc_g_kg < 5 ? "kadime (low)" : soil.soc_g_kg <= 7.5 ? "madhyama (medium)" : "hechchu (high)";
+      const { data: fert } = await supabase
+        .from("ff_advisories").select("message")
+        .eq("farm_id", f.id).in("kind", ["fertiliser", "soil_ph"])
+        .order("valid_for", { ascending: false }).limit(2);
+      parts.push(
+        `📍 ${f.plot_name} (${f.area_acres.toFixed(2)} acre)\n` +
+        `🧪 pH ${ph.toFixed(1)} — ${phTxt}\n` +
+        `🌿 Organic carbon ${(soil.soc_g_kg / 10).toFixed(2)}% — ${oc}\n` +
+        `🪨 ${soil.texture ?? "—"} (clay ${Math.round(soil.clay_pct)}%, sand ${Math.round(soil.sand_pct)}%)` +
+        (fert && fert.length ? "\n\n" + fert.map((a: { message: string }) => a.message).join("\n\n") : "")
+      );
+    }
+    if (!parts.length) {
+      return "🧪 Mannina maahiti innu ready illa. Naale matte nodi.\n(Soil profile not ready yet — check again tomorrow.)";
+    }
+    return clip(
+      `🧪 Mannu, ${farmer.name}:\n\n${parts.join("\n\n")}${morePlots(farms.length)}\n\n` +
+      `(Satellite soil map estimate, 250 m — a lab soil test gives exact values.)`
+    );
+  } catch (err) {
+    console.error("Soil query error:", err);
+    return "Mannina maahiti sigalilla. Matte try maadi. 🙏\n(Could not fetch soil info, try again.)";
+  }
+}
+
+async function handleSown(body: string, farmer: Farmer): Promise<string> {
+  try {
+    const rest = body.slice(body.indexOf(":") + 1).trim();
+    const m = rest.match(/^(.*?)(?:\s+(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?)?$/);
+    const cropName = (m?.[1] || "").trim();
+    if (!cropName) {
+      return "Bele hesaru kali: SOWN: Tomato\n(Send the crop name, e.g. SOWN: Tomato or SOWN: Ragi 05-11)";
+    }
+    const { data: cropKey } = await supabase.rpc("ff_resolve_crop", { p_name: cropName });
+    if (!cropKey) {
+      const { data: cat } = await supabase.from("ff_crop_catalog").select("name_en").order("name_en");
+      return (
+        `"${cropName}" gottagalilla. 🙏\n` +
+        `(Unknown crop. Supported: ${(cat || []).map((c: { name_en: string }) => c.name_en).join(", ")})`
+      );
+    }
+    const today = todayIST();
+    let sown = today;
+    if (m?.[2] && m?.[3]) {
+      const y = m[4] ? (m[4].length === 2 ? "20" + m[4] : m[4]) : today.slice(0, 4);
+      const cand = `${y}-${m[3].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+      if (isNaN(Date.parse(cand))) {
+        return "Dinanka tappu. Udaharane: SOWN: Ragi 05-11\n(Invalid date — use day-month, e.g. 05-11)";
+      }
+      // dd-mm without year that lands in the future means last year
+      sown = !m[4] && cand > today ? `${Number(y) - 1}${cand.slice(4)}` : cand;
+      if (sown > today) return "Mundina dinanka beda. 🙏\n(Sowing date can't be in the future.)";
+    }
+    const farms = await farmerFarms(farmer.id);
+    if (!farms.length) return NO_FARM;
+    const farm = farms[0];
+    await supabase.from("ff_farm_crops")
+      .update({ status: "harvested" })
+      .eq("farm_id", farm.id).eq("crop_key", cropKey).eq("status", "growing");
+    const { error } = await supabase.from("ff_farm_crops")
+      .insert({ farm_id: farm.id, crop_key: cropKey, sown_on: sown, source: "whatsapp" });
+    if (error) {
+      console.error("Sown insert error:", error);
+      return "Save maadalu tappu. Matte try maadi. 🙏";
+    }
+    const { data: st } = await supabase
+      .from("ff_farm_crop_status")
+      .select("name_kn, name_en, expected_harvest, days_to_harvest")
+      .eq("farm_id", farm.id).eq("crop_key", cropKey).maybeSingle();
+    return (
+      `✅ ${st?.name_kn ?? cropName} daakhalaagide — ${farm.plot_name}\n` +
+      `📅 Bitthane: ${shortDate(sown)}\n` +
+      (st ? `🧺 Koylu ~${shortDate(st.expected_harvest)} (${st.days_to_harvest} dina)\n` : "") +
+      `\nGobbara pramaana: SOIL · Havamana: WEATHER\n` +
+      `(${st?.name_en ?? cropName} recorded, sown ${shortDate(sown)}` +
+      (st ? `, harvest expected ~${shortDate(st.expected_harvest)}` : "") +
+      `. Send SOIL for fertiliser doses (ready by tomorrow), WEATHER for alerts.)`
+    );
+  } catch (err) {
+    console.error("Sown error:", err);
+    return "Save maadalu tappu. Matte try maadi. 🙏\n(Could not save, try again.)";
   }
 }
 
